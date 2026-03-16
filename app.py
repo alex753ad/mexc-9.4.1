@@ -1127,7 +1127,9 @@ with st.sidebar:
     _is_scanning = st.session_state.get("scan_running", False)
     scan_btn = c1s.button("🔍 СКАН", width="stretch", type="primary",
                          disabled=_is_scanning)
-    if c2s.button("⛔ СТОП", width="stretch"): st.session_state.cancel_scan = True
+    if c2s.button("⛔ СТОП", width="stretch"):
+        st.session_state.cancel_scan = True
+        st.session_state.scan_running = False
 
     st.markdown("---")
     st.markdown("**📦 Экспорт**")
@@ -1255,6 +1257,12 @@ need_scan = scan_btn or (
     auto_on and st.session_state.current_page == 0
     and st.session_state.last_scan > 0
     and time.time() - st.session_state.last_scan > max(auto_sec - 3, 10))
+
+# B-31 fix: если scan_running завис (СТОП был нажат или скан упал без finally),
+# но скан не запускается в этом rerun — сбрасываем флаг чтобы разблокировать навигацию.
+if st.session_state.get("scan_running") and not need_scan:
+    st.session_state.scan_running = False
+
 if need_scan:
     # Чистим старые сделки перед новым сканом
     try:
