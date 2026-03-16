@@ -1292,7 +1292,7 @@ _sc_count = sum(
     if getattr(r, "is_workable", False)
 )
 _screener_label = f"🎯 Скринер ({_sc_count} 🔥)" if _sc_count > 0 else "🎯 Скринер"
-TAB_LABELS = ["📊 Сканер", "🔍 Стакан", "📈 Переставки", "🤖 Ёршики", _screener_label]
+TAB_LABELS = ["📊 Сканер", "🔍 Стакан", "📈 Переставки", "🤖 Ёршики", _screener_label, "📊 Рендж"]
 cp = st.session_state.current_page
 # B-27 fix: навигация заблокирована пока идёт скан
 _nav_disabled = st.session_state.get("scan_running", False)
@@ -1802,6 +1802,17 @@ elif page == 4:
     else:
         st.error("❌ robot_screener.py не найден. Поместите файл рядом с app.py.")
         st.info("Требуемые файлы: robot_screener.py, history.py, algo_detector.py, book_quality.py, hunter_detector.py")
+
+
+# ═════════════════════════════════════════════════
+# PAGE 5: RANGE BOUNCE SCANNER
+# ═════════════════════════════════════════════════
+elif page == 5:
+    from range_bounce_scanner import render_range_bounce_tab
+    render_range_bounce_tab(
+        client=st.session_state.client,
+        trades_buffer=st.session_state.trades_buffer,
+    )
 
 
 # WS статус бейдж в футере
