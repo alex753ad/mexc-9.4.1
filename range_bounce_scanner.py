@@ -207,36 +207,74 @@ class RangeBounceScanner:
 
     def _detect_range(self, df: pd.DataFrame, cfg: dict) -> Optional[dict]:
         """
-        Определяет ценовой канал на свечах.
+        Определяет ценовой канал на свечах — робастная версия.
+
+        ПРОБЛЕМА со старым min/max-подходом:
+          Одна свеча-шип из 48 (например резкий pump/dump) делает диапазон
+          "min=0.005, max=0.020" при реальном рендже 0.012–0.015.
+          Результат: range_pct = 300% → max_range_pct фильтр убивает монету.
+
+        РЕШЕНИЕ — двухуровневое:
+          1. Основной метод: перцентиль 8-й и 92-й по low/high свечей.
+             Отрезаем ~10% экстремальных свечей с обеих сторон.
+             Одна шип-свеча из 48 ≈ 2% — хорошо попадает в буфер.
+          2. Проверка "плоскости": медианный ATR свечи не должен превышать
+             10% ширины найденного рендж. Если ATR большой — это тренд,
+             не рендж.
+          3. Проверка "населённости": ≥70% свечей должны быть внутри
+             найденного диапазона (close). Иначе это не рендж — цена
+             постоянно выходит за пределы.
+
         Возвращает dict с low/high/age или None если не рендж.
         """
         if df.empty or len(df) < 5:
             return None
 
-        range_low  = df["low"].min()
-        range_high = df["high"].max()
+        n = len(df)
 
-        if range_low <= 0:
+        # ── 1. Перцентильный рендж (8-й и 92-й перцентиль) ──
+        # Чем больше свечей — тем меньший отступ нужен.
+        pct_lo = max(5.0, 100.0 / n)       # ~8% при 48 свечах, ~5% при 100+
+        pct_hi = 100.0 - pct_lo
+
+        range_low  = float(df["low"].quantile(pct_lo / 100))
+        range_high = float(df["high"].quantile(pct_hi / 100))
+
+        if range_low <= 0 or range_high <= range_low:
             return None
 
         range_pct = (range_high - range_low) / range_low * 100
-
         min_r = cfg["min_range_pct"]
         max_r = cfg["max_range_pct"]
 
         if not (min_r <= range_pct <= max_r):
             return None
 
-        # Возраст ренджа — ищем с какой свечи установился текущий диапазон
+        # ── 2. Проверка "плоскости": ATR vs ширина рендж ──
+        # Если медианный размах одной свечи > 40% ширины рендж —
+        # это трендовое движение, а не боковик.
+        candle_ranges = (df["high"] - df["low"]).values
+        median_atr    = float(pd.Series(candle_ranges).median())
+        range_width   = range_high - range_low
+        if range_width > 0 and median_atr / range_width > 0.40:
+            return None  # слишком волатильно, нет чёткого коридора
+
+        # ── 3. Проверка "населённости": % закрытий внутри рендж ──
+        inside = ((df["close"] >= range_low) & (df["close"] <= range_high)).sum()
+        inside_pct = inside / n
+        if inside_pct < 0.65:
+            return None  # цена бо́льшую часть времени вне диапазона
+
+        # ── Возраст ренджа ──
         tf_min = TIMEFRAME_MINUTES.get(cfg["timeframe"], 5)
         range_age_candles = _find_range_age(df, range_low, range_high, cfg)
-        range_age_min = range_age_candles * tf_min
+        range_age_min     = range_age_candles * tf_min
 
         return {
-            "low":      range_low,
-            "high":     range_high,
-            "range_pct": range_pct,
-            "age_min":  range_age_min,
+            "low":         range_low,
+            "high":        range_high,
+            "range_pct":   range_pct,
+            "age_min":     range_age_min,
             "age_candles": range_age_candles,
         }
 
@@ -292,53 +330,67 @@ class RangeBounceScanner:
         # Средний trades_per_min за 4 часа будет выглядеть нормально,
         # но прямо сейчас она мертва.
         #
-        # Решение: смотрим последние recent_candles свечей независимо.
-        # Два условия (оба должны выполняться при recent_min_trades > 0):
-        #   A) Суммарно сделок >= recent_min_trades (не 0-стрип последних свечей)
-        #   B) Доля объёма последних N свечей в общем >= recent_vol_ratio
-        #      Если всего объём за последние 3 свечи составляет <5% от всего
-        #      lookback-объёма — монета сейчас стоит.
+        # MEXC-специфика: поле trades (индекс 8) в klines часто возвращает 0
+        # для спотовых пар. В этом случае используем только объём (план Б).
+        #
+        # Логика:
+        #   Вариант А (trades > 0 в klines):
+        #     - Суммарно сделок >= recent_min_trades за последние N свечей
+        #     - И доля объёма >= recent_vol_ratio
+        #   Вариант Б (trades = 0 везде — MEXC klines bug):
+        #     - Только объём: доля последних N свечей >= recent_vol_ratio
+        #     - Минимальный абсолютный объём за последние N свечей > $1
         # ────────────────────────────────────────────────────────────────
         recent_n        = max(1, cfg.get("recent_candles", 3))
         recent_min_tr   = cfg.get("recent_min_trades", 3)
         recent_vol_thr  = cfg.get("recent_vol_ratio", 0.05)
 
-        recent_df       = df.tail(recent_n)
-        recent_trades   = int(recent_df["trades"].sum())
-        recent_vol      = float(recent_df["quote_vol"].sum())
+        recent_df        = df.tail(recent_n)
+        recent_trades    = int(recent_df["trades"].sum())
+        recent_vol       = float(recent_df["quote_vol"].sum())
+        total_vol_all    = float(df["quote_vol"].sum())
+        recent_vol_ratio = recent_vol / total_vol_all if total_vol_all > 0 else 0.0
 
-        total_vol_all   = float(df["quote_vol"].sum())
-        recent_vol_ratio = (
-            recent_vol / total_vol_all if total_vol_all > 0 else 0.0
-        )
+        # Детектируем MEXC-баг: если ВСЕ свечи имеют trades=0 — игнорируем поле
+        all_trades_zero  = int(df["trades"].sum()) == 0
 
         is_recently_active = True
         if recent_min_tr > 0:
-            # A) абсолютный минимум сделок в последних N свечах
-            if recent_trades < recent_min_tr:
-                is_recently_active = False
-            # B) доля последнего объёма: ниже порога → монета сейчас спит
-            # Нормальная монета даёт примерно recent_n/n_candles доли.
-            # Если recent_vol_ratio < recent_vol_thr — аномально тихо сейчас.
-            if recent_vol_thr > 0 and recent_vol_ratio < recent_vol_thr:
-                is_recently_active = False
+            if all_trades_zero:
+                # Вариант Б: trades недоступны — проверяем только по объёму
+                if recent_vol < 1.0:                       # буквально ноль объёма
+                    is_recently_active = False
+                elif recent_vol_thr > 0 and recent_vol_ratio < recent_vol_thr:
+                    is_recently_active = False
+            else:
+                # Вариант А: trades доступны — проверяем оба условия
+                if recent_trades < recent_min_tr:
+                    is_recently_active = False
+                if recent_vol_thr > 0 and recent_vol_ratio < recent_vol_thr:
+                    is_recently_active = False
 
         if not is_recently_active:
             return None
 
-        # ── Средняя активность за lookback (старая проверка, оставляем) ──
+        # ── Средняя активность за lookback ──
+        # Тоже адаптируем к MEXC-багу: если trades везде 0 — проверяем только объём
         last_candles_5m = max(1, 5 // tf_min)
-        avg_df          = df.tail(last_candles_5m)
-        total_trades_5m = int(avg_df["trades"].sum())
-        elapsed_min     = last_candles_5m * tf_min
-        trades_per_min  = total_trades_5m / elapsed_min if elapsed_min > 0 else 0
-
-        last_candles_1h = max(1, 60 // tf_min)
-        hourly_vol      = float(df.tail(last_candles_1h)["quote_vol"].sum())
+        hourly_candles  = max(1, 60 // tf_min)
+        hourly_vol      = float(df.tail(hourly_candles)["quote_vol"].sum())
 
         min_tpm  = cfg["min_trades_per_min"]
         min_hvol = cfg["min_volume_per_hour"]
-        active   = (trades_per_min >= min_tpm) or (hourly_vol >= min_hvol)
+
+        if all_trades_zero:
+            # Только объёмная проверка
+            active = hourly_vol >= min_hvol
+        else:
+            avg_df         = df.tail(last_candles_5m)
+            total_trades_5m = int(avg_df["trades"].sum())
+            elapsed_min    = last_candles_5m * tf_min
+            trades_per_min = total_trades_5m / elapsed_min if elapsed_min > 0 else 0
+            active = (trades_per_min >= min_tpm) or (hourly_vol >= min_hvol)
+
         if not active:
             return None
 
@@ -458,22 +510,43 @@ class RangeBounceScanner:
 
     def scan(self, symbols: list[str], cfg: dict,
              progress_cb=None) -> list[RangeResult]:
-        """Сканирует список символов. progress_cb(done, total)."""
-        results = []
-        total = len(symbols)
-        for i, sym in enumerate(symbols):
+        """
+        Сканирует список символов параллельно.
+
+        Использует ThreadPoolExecutor для одновременных HTTP-запросов к MEXC.
+        Количество воркеров берётся из cfg["scan_workers"] (дефолт 8).
+        MEXC лимит: ~10 req/s на IP. При 8 воркерах и ~0.3с на запрос —
+        примерно 25 req/s, что комфортно. При проблемах с 429 — снижай до 4.
+
+        progress_cb(done, total) — вызывается после каждой обработанной монеты.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        workers   = cfg.get("scan_workers", 8)
+        top_n     = cfg.get("top_results", 50)
+        total     = len(symbols)
+        results   = []
+        done_count = [0]  # mutable для замыкания
+
+        def _analyze_one(sym: str) -> Optional[RangeResult]:
             try:
-                r = self.analyze_symbol(sym, cfg)
+                return self.analyze_symbol(sym, cfg)
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_analyze_one, sym): sym for sym in symbols}
+            for future in as_completed(futures):
+                r = future.result()
                 if r is not None:
                     results.append(r)
-            except Exception:
-                pass
-            if progress_cb:
-                progress_cb(i + 1, total)
+                done_count[0] += 1
+                if progress_cb:
+                    progress_cb(done_count[0], total)
 
         # Сортировка: сначала по скору (убыв.), потом по позиции в рендже (ближе к дну)
         results.sort(key=lambda r: (-r.score, r.position_in_range))
-        return results[:cfg.get("top_results", 50)]
+        return results[:top_n]
 
     def get_chart(self, symbol: str, cfg: dict, result: RangeResult) -> Optional[go.Figure]:
         """Строит свечной график с разметкой ренджа и отскоков."""
@@ -493,11 +566,16 @@ def _find_range_age(df: pd.DataFrame, range_low: float, range_high: float, cfg: 
     """
     Возвращает кол-во свечей назад с момента установления текущего канала.
     Идём с конца назад и ищем первую свечу, которая пробила бы диапазон.
+
+    Допуск увеличен с 0.5% до 2% потому что range_low/range_high теперь
+    перцентильные (не абсолютный min/max). Допустимо что несколько свечей
+    слегка выходят за границу — это нормально для бокового рынка.
     """
     n = len(df)
+    tolerance = 0.02  # 2% — перцентильный рендж уже "мягкий"
     for i in range(n - 1, -1, -1):
         row = df.iloc[i]
-        if row["low"] < range_low * 0.995 or row["high"] > range_high * 1.005:
+        if row["low"] < range_low * (1 - tolerance) or row["high"] > range_high * (1 + tolerance):
             return n - i - 1  # количество свечей ПОСЛЕ этой
     return n  # весь период в рендже
 
@@ -753,10 +831,11 @@ def render_range_bounce_tab(client, trades_buffer=None):
         from range_bounce_scanner import render_range_bounce_tab
         render_range_bounce_tab(client, st.session_state.trades_buffer)
     """
-    st.markdown("### 📊 Range Bounce Scanner v2.0")
+    st.markdown("### 📊 Range Bounce Scanner v2.1")
     st.caption(
         "Ищет монеты с **двусторонним** рендж-паттерном (цена ходит от дна к верху и обратно). "
-        "Три тега: **[Big Size]** — крупный объём у дна, "
+        "Сканирует **все** USDT-пары MEXC параллельно. "
+        "Теги: **[Big Size]** — крупный объём у дна, "
         "**[Aged]** — рендж существует долго, "
         "**[Rejected ×N]** — многократные отскоки."
     )
@@ -775,19 +854,41 @@ def render_range_bounce_tab(client, trades_buffer=None):
 
         with c2:
             st.markdown("**Активность**")
-            min_tpm  = st.slider("Мин. сделок/мин (среднее)", 1, 50, 5, key="rbs_tpm")
-            min_hvol = st.number_input("Мин. объём/час ($)", 100, 100_000, 5000, 500, key="rbs_hvol")
+            min_tpm  = st.slider("Мин. сделок/мин (среднее)", 0, 50, 1, key="rbs_tpm",
+                                 help="0 = не проверять. MEXC часто не возвращает "
+                                      "кол-во сделок в klines — тогда проверяется только объём.")
+            min_hvol = st.number_input("Мин. объём/час ($)", 0, 100_000, 500, 100, key="rbs_hvol")
             st.markdown("**Big Size**")
             vol_mult   = st.slider("Множитель объёма", 2.0, 30.0, 10.0, 1.0, key="rbs_vmult")
             vol_period = st.slider("Период для среднего (мин)", 5, 60, 5, 5, key="rbs_vperiod")
 
         with c3:
             st.markdown("**Бонусы**")
-            min_age      = st.slider("Мин. возраст ренджа (мин)", 10, 240, 60, 10, key="rbs_age")
-            min_bounces  = st.slider("Мин. отскоков (низ)", 1, 5, 3, key="rbs_minb")
+            min_age      = st.slider("Мин. возраст ренджа (мин)", 0, 240, 30, 10, key="rbs_age")
+            min_bounces  = st.slider("Мин. отскоков (низ)", 1, 5, 2, key="rbs_minb")
             max_bounces  = st.slider("Макс. отскоков (низ)", 5, 20, 9, key="rbs_maxb")
-            bounce_confirm = st.slider("Мин. отскок (% от ширины)", 5.0, 50.0, 10.0, 5.0, key="rbs_bc")
-            top_n        = st.slider("Топ-N результатов", 10, 200, 50, 10, key="rbs_topn")
+            bounce_confirm = st.slider("Мин. отскок (% от ширины)", 5.0, 50.0, 8.0, 1.0, key="rbs_bc")
+            top_n        = st.slider("Топ-N результатов", 10, 500, 100, 10, key="rbs_topn")
+
+        st.markdown("---")
+        st.markdown("**🌐 Охват и скорость**")
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            min_sym_vol = st.number_input(
+                "Мин. объём пары за 24h ($)", 0, 100_000, 50, 50, key="rbs_minvol",
+                help="Пары с объёмом ниже этой суммы пропускаются. "
+                     "$50 = берём почти всё. $1000 = только ликвидные."
+            )
+        with sc2:
+            scan_workers = st.slider(
+                "Параллельных запросов", 2, 20, 8, key="rbs_workers",
+                help="Количество одновременных запросов к MEXC API. "
+                     "8 = оптимально. При ошибках 429 снижай до 4."
+            )
+        with sc3:
+            st.metric("Ожидаемое время скана",
+                      f"~{max(1, 2000 // scan_workers // 10)} мин",
+                      help="Приблизительно для ~2000 пар MEXC")
 
         st.markdown("---")
         st.markdown("**🔍 Фильтры качества (v2.0)**")
@@ -812,9 +913,9 @@ def render_range_bounce_tab(client, trades_buffer=None):
         with fc3:
             st.markdown("**[F3] Utilization**")
             min_util = st.slider(
-                "Мин. utilization", 0.0, 0.5, 0.10, 0.01, key="rbs_util",
+                "Мин. utilization", 0.0, 0.5, 0.08, 0.01, key="rbs_util",
                 help="√(lower% × upper%) < порога → монета застряла в углу рендж. "
-                     "0.0 = выключено, 0.10 = мягко, 0.20 = строго"
+                     "0.0 = выключено, 0.08 = мягко, 0.15 = строго"
             )
 
         with fc4:
@@ -825,15 +926,15 @@ def render_range_bounce_tab(client, trades_buffer=None):
                      "Защита от монет, активных 30 мин из 24 часов."
             )
             recent_min_trades = st.slider(
-                "Мин. сделок за N свечей", 0, 30, 3, key="rbs_rmt",
-                help="0 = выключено. Если последние N свечей дали "
-                     "меньше X сделок — монета сейчас мертва."
+                "Мин. сделок за N свечей", 0, 30, 0, key="rbs_rmt",
+                help="0 = выключено (рекомендуется: MEXC часто не заполняет "
+                     "поле trades в klines). Проверка идёт через объём."
             )
             recent_vol_ratio = st.slider(
-                "Мин. доля последнего объёма", 0.0, 0.20, 0.05, 0.01,
+                "Мин. доля последнего объёма", 0.0, 0.20, 0.03, 0.01,
                 key="rbs_rvr",
                 help="Мин. доля объёма последних N свечей от общего "
-                     "lookback-объёма. <5% → монета сейчас спит."
+                     "lookback-объёма. <3% → монета сейчас спит."
             )
 
     cfg = {
@@ -851,6 +952,9 @@ def render_range_bounce_tab(client, trades_buffer=None):
         "max_bounces":         max_bounces,
         "bounce_confirm_pct":  bounce_confirm,
         "top_results":         top_n,
+        # охват
+        "min_symbol_vol_usdt": min_sym_vol,
+        "scan_workers":        scan_workers,
         # v2.0
         "dead_book_filter":    dead_book_on,
         "min_top_bounces":     min_top_bounces,
@@ -869,30 +973,46 @@ def render_range_bounce_tab(client, trades_buffer=None):
         last_scan = st.session_state.get("rbs_last_scan_time")
         if last_scan:
             elapsed = int(time.time() - last_scan)
+            n_scanned = st.session_state.get("rbs_last_scanned", 0)
             st.caption(f"Последний скан: {elapsed} сек. назад | "
+                       f"Просканировано: {n_scanned} пар | "
                        f"Найдено: {len(st.session_state.get('rbs_results', []))} монет")
 
     if run_scan:
-        # Получаем список монет (от основного скана или запрашиваем сами)
-        symbols = _get_symbols_for_scan(client)
+        symbols = _get_symbols_for_scan(client, cfg)
         if not symbols:
-            st.error("Не удалось получить список монет. Сначала запусти основной скан.")
+            st.error("Не удалось получить список монет. Проверь подключение к MEXC.")
         else:
+            st.info(f"🔎 Сканирую {len(symbols)} пар с {scan_workers} параллельными запросами...")
             scanner = RangeBounceScanner(client, trades_buffer)
             progress_bar = st.progress(0, text="Сканирование...")
 
+            found_live = [0]  # счётчик найденных в реальном времени
             def _progress(done, total):
                 pct = done / total
-                progress_bar.progress(pct, text=f"Сканирование {done}/{total}...")
+                found = found_live[0]
+                progress_bar.progress(
+                    pct,
+                    text=f"Сканирование {done}/{total} пар... найдено: {found}"
+                )
 
-            with st.spinner(f"Анализирую {len(symbols)} монет..."):
-                results = scanner.scan(symbols, cfg, progress_cb=_progress)
+            # Патчим analyze_symbol чтобы обновлять счётчик найденных
+            _orig_analyze = scanner.analyze_symbol
+            def _patched_analyze(sym, c):
+                r = _orig_analyze(sym, c)
+                if r is not None:
+                    found_live[0] += 1
+                return r
+            scanner.analyze_symbol = _patched_analyze
+
+            results = scanner.scan(symbols, cfg, progress_cb=_progress)
 
             progress_bar.empty()
-            st.session_state["rbs_results"] = results
+            st.session_state["rbs_results"]       = results
             st.session_state["rbs_last_scan_time"] = time.time()
-            st.session_state["rbs_scanner"] = scanner
-            st.session_state["rbs_cfg"] = cfg
+            st.session_state["rbs_last_scanned"]   = len(symbols)
+            st.session_state["rbs_scanner"]        = scanner
+            st.session_state["rbs_cfg"]            = cfg
             st.rerun()
 
     # ── Результаты ──
@@ -1103,31 +1223,49 @@ def render_range_bounce_tab(client, trades_buffer=None):
 # Вспомогательные
 # ═══════════════════════════════════════════════
 
-def _get_symbols_for_scan(client) -> list[str]:
-    """Получает список символов для скана."""
-    # Пробуем из session_state (если основной скан уже запускался)
+def _get_symbols_for_scan(client, cfg: dict) -> list[str]:
+    """
+    Получает полный список USDT-спот-пар MEXC для скана.
+
+    Порядок приоритетов:
+      1. session_state["scan_results"] — если основной скан уже запущен,
+         берём его список (уже отфильтрован по объёму).
+      2. GET /api/v3/ticker/24hr — все тикеры, фильтруем сами.
+         Берём ВСЕ USDT-пары с любым объёмом выше min_usdt_vol.
+         Без лимита на количество.
+
+    Параметр cfg["min_symbol_vol_usdt"] — мин. 24h объём (дефолт $50).
+    Ниже $50 торговли буквально нет — это технически мёртвые пары.
+    """
+    min_vol = cfg.get("min_symbol_vol_usdt", 50.0)
+
+    # 1. Из основного скана (уже отфильтровано)
     if "scan_results" in st.session_state:
         scan_res = st.session_state["scan_results"]
         if scan_res and isinstance(scan_res, list):
             syms = [r.get("symbol") or r.get("Пара") for r in scan_res if isinstance(r, dict)]
             syms = [s for s in syms if s and s.endswith("USDT")]
-            if syms:
+            if len(syms) >= 10:
                 return syms
 
-    # Фоллбэк: тикеры напрямую
+    # 2. Прямой запрос всех тикеров
     try:
         tickers = client.get_all_tickers_24h()
         if not tickers or not isinstance(tickers, list):
             return []
-        filtered = []
+
+        pairs = []
         for t in tickers:
             sym = t.get("symbol", "")
             if not sym.endswith("USDT"):
                 continue
             vol = float(t.get("quoteVolume", 0) or 0)
-            if 100 <= vol <= 10_000_000:
-                filtered.append((sym, vol))
-        filtered.sort(key=lambda x: x[1], reverse=True)
-        return [s for s, _ in filtered[:300]]
+            if vol >= min_vol:
+                pairs.append((sym, vol))
+
+        # Сортируем по объёму убывая — сначала самые ликвидные
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in pairs]
+
     except Exception:
         return []
